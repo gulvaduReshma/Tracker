@@ -18,6 +18,7 @@ const firebaseConfig = {
 // ---------- Firebase Init ----------
 firebase.initializeApp(firebaseConfig);
 const firestore = firebase.firestore();
+const storage = firebase.storage();
 const DB_DOC = firestore.collection('pocTracker').doc('mainData');
 
 // ---------- State ----------
@@ -162,6 +163,8 @@ function updateAdminUI() {
     if (adminControls) adminControls.style.display = isAdmin ? 'flex' : 'none';
     if (sidebarAddCustBtn) sidebarAddCustBtn.style.display = isAdmin ? 'inline-flex' : 'none';
     if (customerAdminActions) customerAdminActions.style.display = isAdmin ? 'flex' : 'none';
+    const uploadBtn = document.getElementById('uploadDocumentBtn');
+    if (uploadBtn) uploadBtn.style.display = isAdmin ? 'inline-flex' : 'none';
     if (pocAdminActions) pocAdminActions.style.display = isAdmin ? 'flex' : 'none';
 
     if (adminToggleBtn) {
@@ -375,6 +378,7 @@ function showCustomer(customerId) {
 
     showView('customerView');
     renderPocGrid();
+    renderCustomerDocuments();
     highlightActiveNav();
     updateAdminUI();
 }
@@ -544,82 +548,79 @@ function renderPocGrid() {
 // ============================================================
 // RENDER: TEST CASES TABLE (Execution Page)
 // ============================================================
+const DEFAULT_COLUMNS = [
+    { key: 'module', label: 'Module' }, { key: 'scenario', label: 'Scenario' },
+    { key: 'execStep', label: 'Execution Step' }, { key: 'expectedBehavior', label: 'Expected Behavior' },
+    { key: 'actualBehavior', label: 'Actual Behavior' }, { key: 'comment', label: 'Comment' },
+    { key: 'status', label: 'Status' }
+];
+function getPocColumns(poc) {
+    const columns = Array.isArray(poc.columns) && poc.columns.length ? poc.columns : DEFAULT_COLUMNS;
+    return [...columns.filter(c => c.key !== 'status'), columns.find(c => c.key === 'status') || {key:'status',label:'Status'}];
+}
+function removePocColumn(key) {
+    if (!isAdmin || key === 'status') return toast('Status is mandatory and cannot be deleted.', 'error');
+    const poc = getPoc(currentCustomerId, currentPocId);
+    const col = getPocColumns(poc).find(c => c.key === key);
+    if (!col || !confirm(`Delete column "${col.label}" and its values from this POC? This cannot be undone.`)) return;
+    poc.columns = getPocColumns(poc).filter(c => c.key !== key);
+    poc.testCases.forEach(tc => { if (key.startsWith('extra:')) delete (tc.extra || {})[key.slice(6)]; else delete tc[key]; });
+    saveData(); renderTestCases(); toast(`Column "${col.label}" deleted.`, 'success');
+}
+function initColumnResize(table, poc) {
+    table.querySelectorAll('thead th[data-col-key]').forEach(th => {
+        const handle = th.querySelector('.column-resizer');
+        if (!handle) return;
+        handle.addEventListener('pointerdown', e => {
+            e.preventDefault(); e.stopPropagation();
+            const startX = e.clientX, startWidth = th.getBoundingClientRect().width;
+            const key = th.dataset.colKey;
+            const move = ev => {
+                const width = Math.max(85, Math.round(startWidth + ev.clientX - startX));
+                th.style.width = width + 'px'; th.style.minWidth = width + 'px';
+                table.querySelectorAll(`td[data-col-key="${CSS.escape(key)}"]`).forEach(td => { td.style.width = width + 'px'; td.style.minWidth = width + 'px'; });
+            };
+            const stop = ev => {
+                move(ev); document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', stop);
+                poc.columnWidths = poc.columnWidths || {};
+                poc.columnWidths[key] = Math.max(85, Math.round(startWidth + ev.clientX - startX));
+                saveData();
+            };
+            document.addEventListener('pointermove', move);
+            document.addEventListener('pointerup', stop, {once:true});
+        });
+    });
+}
 function renderTestCases() {
     const poc = getPoc(currentCustomerId, currentPocId);
     if (!poc) return;
-
+    const columns = getPocColumns(poc);
     const statusFilter = document.getElementById('statusFilter')?.value || 'all';
     const moduleFilter = document.getElementById('moduleFilter')?.value || 'all';
     const search = (document.getElementById('searchInput')?.value || '').toLowerCase();
-
-    let filtered = poc.testCases.filter(tc => {
+    const filtered = poc.testCases.filter(tc => {
         if (statusFilter !== 'all' && tc.status !== statusFilter) return false;
         if (moduleFilter !== 'all' && tc.module !== moduleFilter) return false;
-        if (search) {
-            const text = [tc.module, tc.scenario, tc.execStep, tc.expectedBehavior, tc.actualBehavior, tc.comment].join(' ').toLowerCase();
-            if (!text.includes(search)) return false;
-        }
-        return true;
+        return !search || columns.some(c => String(c.key.startsWith('extra:') ? (tc.extra || {})[c.key.slice(6)] || '' : tc[c.key] || '').toLowerCase().includes(search));
     });
-
     const tbody = document.getElementById('testCaseBody');
     const thead = document.getElementById('testCaseHead');
     const emptyMsg = document.getElementById('emptyTestCases');
     const table = document.getElementById('testCaseTable');
-
-    if (thead) {
-        thead.innerHTML = `
-            <tr>
-                <th class="col-no">#</th>
-                <th class="col-module">Module</th>
-                <th class="col-scenario">Scenario</th>
-                <th class="col-step">Execution Step</th>
-                <th class="col-expected">Expected Behavior</th>
-                <th class="col-actual">Actual Behavior</th>
-                <th class="col-comment">Comment</th>
-                <th class="col-status">Status</th>
-                ${isAdmin ? '<th class="col-actions">Actions</th>' : ''}
-            </tr>
-        `;
-    }
-
-    if (filtered.length === 0) {
-        tbody.innerHTML = '';
-        emptyMsg.style.display = 'block';
-        table.style.display = 'none';
+    const width = key => (poc.columnWidths && poc.columnWidths[key] ? `width:${poc.columnWidths[key]}px;min-width:${poc.columnWidths[key]}px;` : '');
+    const statusOptions = ['Not Executed', 'In Progress', 'Pass', 'Fail', 'Blocked'];
+    thead.innerHTML = `<tr><th class="col-no">#</th>${columns.map(c => `<th data-col-key="${escHtml(c.key)}" style="${width(c.key)}">${escHtml(c.label)}${isAdmin && c.key !== 'status' ? `<button class="delete-column" type="button" title="Delete column ${escHtml(c.label)}" onclick="removePocColumn(decodeURIComponent('${encodeURIComponent(c.key)}'))"><i class="fas fa-times"></i></button>` : ''}<span class="column-resizer" title="Drag to resize column"></span></th>`).join('')}${isAdmin ? '<th class="col-actions">Actions</th>' : ''}</tr>`;
+    if (!filtered.length) {
+        tbody.innerHTML = ''; emptyMsg.style.display = 'block'; table.style.display = 'none';
     } else {
-        emptyMsg.style.display = 'none';
-        table.style.display = 'table';
-        tbody.innerHTML = filtered.map((tc) => {
-            const statusClass = 'status-' + tc.status.toLowerCase().replace(/\s+/g, '-');
-            return `
-            <tr data-id="${tc.id}">
-                <td class="col-no" style="text-align:center;font-weight:600;color:var(--gray-400)">${tc.testNo}</td>
-                <td><div class="editable-cell" contenteditable="true" data-field="module" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.module)}</div></td>
-                <td><div class="editable-cell" contenteditable="true" data-field="scenario" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.scenario)}</div></td>
-                <td><div class="editable-cell" contenteditable="true" data-field="execStep" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.execStep)}</div></td>
-                <td><div class="editable-cell" contenteditable="true" data-field="expectedBehavior" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.expectedBehavior)}</div></td>
-                <td><div class="editable-cell" contenteditable="true" data-field="actualBehavior" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.actualBehavior)}</div></td>
-                <td><div class="editable-cell" contenteditable="true" data-field="comment" data-id="${tc.id}" onblur="onCellEdit(this)">${escHtml(tc.comment)}</div></td>
-                <td>
-                    <select class="status-select ${statusClass}" data-id="${tc.id}" onchange="onStatusChange(this)">
-                        <option value="Not Executed" ${tc.status === 'Not Executed' ? 'selected' : ''}>Not Executed</option>
-                        <option value="In Progress" ${tc.status === 'In Progress' ? 'selected' : ''}>In Progress</option>
-                        <option value="Pass" ${tc.status === 'Pass' ? 'selected' : ''}>Pass</option>
-                        <option value="Fail" ${tc.status === 'Fail' ? 'selected' : ''}>Fail</option>
-                        <option value="Blocked" ${tc.status === 'Blocked' ? 'selected' : ''}>Blocked</option>
-                    </select>
-                </td>
-                ${isAdmin ? `
-                <td class="col-actions">
-                    <div class="row-actions">
-                        <button title="Delete Test Case" onclick="deleteTestCase('${tc.id}')"><i class="fas fa-trash"></i></button>
-                    </div>
-                </td>` : ''}
-            </tr>`;
-        }).join('');
+        emptyMsg.style.display = 'none'; table.style.display = 'table';
+        tbody.innerHTML = filtered.map(tc => `<tr data-id="${escHtml(tc.id)}"><td class="col-no">${tc.testNo}</td>${columns.map(c => {
+            if (c.key === 'status') return `<td data-col-key="status" style="${width('status')}"><select class="status-select status-${String(tc.status || 'Not Executed').toLowerCase().replace(/\s+/g,'-')}" data-id="${escHtml(tc.id)}" onchange="onStatusChange(this)">${statusOptions.map(opt => `<option value="${opt}" ${tc.status === opt ? 'selected' : ''}>${opt}</option>`).join('')}</select></td>`;
+            const value = c.key.startsWith('extra:') ? (tc.extra || {})[c.key.slice(6)] : tc[c.key];
+            return `<td data-col-key="${escHtml(c.key)}" style="${width(c.key)}"><div class="editable-cell" contenteditable="true" data-field="${escHtml(c.key)}" data-id="${escHtml(tc.id)}" onblur="onCellEdit(this)">${escHtml(String(value ?? ''))}</div></td>`;
+        }).join('')}${isAdmin ? `<td class="col-actions"><button class="btn btn-ghost btn-sm" title="Delete Test Case" onclick="deleteTestCase('${escHtml(tc.id)}')"><i class="fas fa-trash"></i></button></td>` : ''}</tr>`).join('');
     }
-
+    initColumnResize(table, poc);
     // Stats bar update
     const allStats = getTestCaseStats(poc.testCases);
     const pocStatsEl = document.getElementById('pocStats');
@@ -657,7 +658,11 @@ function onCellEdit(el) {
     const poc = getPoc(currentCustomerId, currentPocId);
     if (!poc) return;
     const tc = poc.testCases.find(t => t.id === tcId);
-    if (tc && tc[field] !== value) {
+    if (tc && field.startsWith('extra:')) {
+        tc.extra = tc.extra || {};
+        tc.extra[field.slice(6)] = value;
+        saveData();
+    } else if (tc && tc[field] !== value) {
         tc[field] = value;
         saveData();
     }
@@ -726,7 +731,7 @@ function showAdminUploadModal() {
                 return false;
             }
             targetCustomer = { id: genId(), name: newName, pocs: [] };
-            db.customers.push(targetCustomer);
+            // Only persist a new customer after successful workbook validation.
         } else {
             targetCustomer = getCustomer(select.value);
         }
@@ -755,72 +760,55 @@ function toggleNewCustomerInput(val) {
 
 function executeExcelImport(file, customer) {
     const reader = new FileReader();
-    reader.onload = function (e) {
+    reader.onload = function(e) {
         try {
-            const workbook = XLSX.read(e.target.result, { type: 'array' });
-            let totalAdded = 0;
-            let pocsCreated = 0;
-
-            if (workbook.SheetNames.length > 1) {
-                // Multi-sheet: each sheet is a POC
-                workbook.SheetNames.forEach(sheetName => {
-                    const sheet = workbook.Sheets[sheetName];
-                    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-                    if (rows.length === 0) return;
-
-                    const poc = createOrGetPoc(customer, sheetName.trim());
-                    const colMap = detectColumns(Object.keys(rows[0]));
-                    rows.forEach(row => {
-                        poc.testCases.push(rowToTestCase(row, colMap, poc.testCases.length + 1));
-                        totalAdded++;
-                    });
-                    pocsCreated++;
+            const workbook = XLSX.read(e.target.result, {type:'array'});
+            const sheets = workbook.SheetNames.map(name => {
+                const rows = XLSX.utils.sheet_to_json(workbook.Sheets[name], {defval:'', raw:false});
+                const headers = XLSX.utils.sheet_to_json(workbook.Sheets[name], {header:1, defval:''})[0] || [];
+                return {name, rows, headers: headers.map(String)};
+            }).filter(s => s.rows.length || s.headers.some(h => h.trim()));
+            if (!sheets.length) throw new Error('Import rejected: Excel file is empty.');
+            const invalid = sheets.filter(s => !s.headers.some(h => h.trim().toLowerCase() === 'status'));
+            if (invalid.length) throw new Error(`Import rejected. Mandatory "Status" column is missing in sheet(s): ${invalid.map(s => s.name).join(', ')}. Add a column headed Status to every sheet and upload again.`);
+            // Validate the entire workbook before changing any customer/POC data.
+            if (!db.customers.some(c => c.id === customer.id)) db.customers.push(customer);
+            let count = 0;
+            sheets.forEach(sheet => {
+                const colMap = detectColumns(sheet.headers);
+                const statusHeader = sheet.headers.find(h => h.trim().toLowerCase() === 'status');
+                const pocHeader = sheets.length === 1 ? detectPocColumn(sheet.headers) : null;
+                const groups = new Map();
+                sheet.rows.forEach(row => {
+                    const pocName = sheets.length > 1 ? sheet.name.trim() : pocHeader ? String(row[pocHeader] || 'Default POC').trim() : file.name.replace(/\.(xlsx|xls|csv)$/i,'').trim();
+                    if (!groups.has(pocName)) groups.set(pocName, []);
+                    groups.get(pocName).push(row);
                 });
-            } else {
-                // Single sheet: check for POC column
-                const sheet = workbook.Sheets[workbook.SheetNames[0]];
-                const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-                if (rows.length === 0) { toast('Excel file is empty!', 'error'); return; }
-
-                const headers = Object.keys(rows[0]);
-                const colMap = detectColumns(headers);
-                const pocCol = detectPocColumn(headers);
-
-                if (pocCol) {
-                    const groups = {};
+                groups.forEach((rows, pocName) => {
+                    const poc = createOrGetPoc(customer, pocName || 'Imported POC');
+                    const mapped = new Map(Object.entries(colMap).filter(([k,v]) => v).map(([k,v]) => [v, ({expected:'expectedBehavior',actual:'actualBehavior',status:'status'})[k] || k]));
+                    mapped.set(statusHeader, 'status');
+                    const columns = sheet.headers.filter(h => h.trim() && h !== pocHeader).map(h => ({key: mapped.get(h) || 'extra:' + h, label:h}));
+                    const seen = new Set();
+                    poc.columns = columns.filter(c => {if (seen.has(c.key)) return false; seen.add(c.key); return true;});
+                    if (!seen.has('status')) poc.columns.push({key:'status',label:statusHeader});
                     rows.forEach(row => {
-                        const pocName = String(row[pocCol] || 'Default POC').trim();
-                        if (!groups[pocName]) groups[pocName] = [];
-                        groups[pocName].push(row);
+                        const tc = rowToTestCase(row, {...colMap,status:statusHeader}, poc.testCases.length+1);
+                        tc.extra = {};
+                        columns.filter(c => c.key.startsWith('extra:')).forEach(c => tc.extra[c.key.slice(6)] = String(row[c.label] ?? ''));
+                        poc.testCases.push(tc); count++;
                     });
-                    Object.entries(groups).forEach(([pocName, groupRows]) => {
-                        const poc = createOrGetPoc(customer, pocName);
-                        groupRows.forEach(row => {
-                            poc.testCases.push(rowToTestCase(row, colMap, poc.testCases.length + 1));
-                            totalAdded++;
-                        });
-                        pocsCreated++;
-                    });
-                } else {
-                    const pocName = file.name.replace(/\.(xlsx|xls|csv)$/i, '').trim() || 'Imported POC';
-                    const poc = createOrGetPoc(customer, pocName);
-                    rows.forEach(row => {
-                        poc.testCases.push(rowToTestCase(row, colMap, poc.testCases.length + 1));
-                        totalAdded++;
-                    });
-                    pocsCreated = 1;
-                }
-            }
-
-            saveData();
-            showCustomer(customer.id);
-            renderSidebar();
-            toast(`Successfully imported ${totalAdded} test cases across ${pocsCreated} POC(s)!`, 'success');
-        } catch (err) {
-            console.error('Import error:', err);
-            toast('Error parsing Excel: ' + err.message, 'error');
+                });
+            });
+            saveData(); showCustomer(customer.id); renderSidebar();
+            toast(`Imported ${count} test cases successfully. Status column validated.`, 'success');
+        } catch(err) {
+            console.error('Excel import error:',err);
+            alert(err.message);
+            toast(err.message, 'error');
         }
     };
+    reader.onerror = () => toast('Unable to read the Excel file.', 'error');
     reader.readAsArrayBuffer(file);
 }
 
@@ -868,13 +856,13 @@ function detectColumns(headers) {
         return null;
     }
     return {
-        module:   find(['module', 'component', 'feature', 'area']) || headers[1] || '',
-        scenario: find(['scenario', 'test case', 'testcase', 'description', 'title', 'name']) || headers[2] || '',
-        execStep: find(['exec', 'step', 'procedure', 'action', 'steps']) || headers[3] || '',
-        expected: find(['expected', 'expect']) || headers[4] || '',
-        actual:   find(['actual', 'result', 'observed']) || headers[5] || '',
-        comment:  find(['comment', 'note', 'remark', 'observation']) || headers[6] || '',
-        status:   find(['status', 'verdict', 'outcome', 'pass', 'result']) || headers[7] || ''
+        module:   find(['module', 'component', 'feature', 'area']) || '',
+        scenario: find(['scenario', 'test case', 'testcase', 'description', 'title', 'name']) || '',
+        execStep: find(['exec', 'step', 'procedure', 'action', 'steps']) || '',
+        expected: find(['expected', 'expect']) || '',
+        actual:   find(['actual', 'result', 'observed']) || '',
+        comment:  find(['comment', 'note', 'remark', 'observation']) || '',
+        status:   find(['status', 'verdict', 'outcome', 'pass', 'result']) || ''
     };
 }
 
@@ -1014,22 +1002,14 @@ function exportPocToExcel() {
     const customer = getCustomer(currentCustomerId);
     if (!poc || poc.testCases.length === 0) { toast('No test cases to export', 'error'); return; }
 
-    const data = poc.testCases.map(tc => ({
-        'Test No.': tc.testNo,
-        'Module': tc.module,
-        'Scenario': tc.scenario,
-        'Execution Step': tc.execStep,
-        'Expected Behavior': tc.expectedBehavior,
-        'Actual Behavior': tc.actualBehavior,
-        'Comment': tc.comment,
-        'Status': tc.status
-    }));
-
+    const columns = getPocColumns(poc);
+    const data = poc.testCases.map(tc => {
+        const row = {'Test No.':tc.testNo};
+        columns.forEach(c => row[c.label] = c.key.startsWith('extra:') ? (tc.extra || {})[c.key.slice(6)] || '' : tc[c.key] || '');
+        return row;
+    });
     const ws = XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [
-        { wch: 8 }, { wch: 15 }, { wch: 30 }, { wch: 35 },
-        { wch: 30 }, { wch: 30 }, { wch: 20 }, { wch: 14 }
-    ];
+    ws['!cols'] = [{wch:10}, ...columns.map(c => ({wch:Math.max(14,Math.min(50,Math.round((poc.columnWidths || {})[c.key] / 7) || 24))}))];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, poc.name.slice(0, 31));
     XLSX.writeFile(wb, `${customer.name}_${poc.name}_TestResults.xlsx`);
@@ -1134,4 +1114,114 @@ function escHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+// ============================================================
+// CUSTOMER WORD DOCUMENTS
+// ============================================================
+function renderCustomerDocuments() {
+    const customer = getVisibleCustomers().find(c => c.id === currentCustomerId);
+    const list = document.getElementById('customerDocumentsList');
+    if (!list) return;
+    if (!customer) { list.replaceChildren(); return; }
+    const documents = customer.documents || [];
+    list.replaceChildren();
+    if (!documents.length) {
+        const empty = document.createElement('p');
+        empty.className = 'document-empty';
+        empty.textContent = 'No documents shared yet.';
+        list.appendChild(empty);
+        return;
+    }
+    documents.forEach(doc => {
+        const row = document.createElement('div');
+        row.className = 'document-row';
+        const label = document.createElement('span');
+        label.textContent = '📄 ' + doc.name;
+        const actions = document.createElement('div');
+        actions.className = 'document-actions';
+        const download = document.createElement('button');
+        download.className = 'btn btn-outline btn-sm';
+        download.textContent = 'Download';
+        download.onclick = () => downloadCustomerDocument(customer.id, doc);
+        actions.appendChild(download);
+        if (isAdmin) {
+            const remove = document.createElement('button');
+            remove.className = 'btn btn-danger btn-sm';
+            remove.textContent = 'Delete';
+            remove.onclick = () => deleteCustomerDocument(customer.id, doc);
+            actions.appendChild(remove);
+        }
+        row.append(label, actions);
+        list.appendChild(row);
+    });
+}
+
+async function uploadCustomerDocument(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file || !isAdmin || !currentCustomerId) return;
+    if (!/\.(doc|docx)$/i.test(file.name)) {
+        toast('Only Word .doc or .docx files are allowed.', 'error'); return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+        toast('Maximum file size is 20 MB.', 'error'); return;
+    }
+    const customerId = currentCustomerId;
+    const id = genId();
+    const path = `customer-documents/${customerId}/${id}/${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const ref = storage.ref(path);
+    try {
+        toast('Uploading Word document...', 'info');
+        await ref.put(file, { contentType: file.name.toLowerCase().endsWith('.docx') ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'application/msword' });
+        // Record only the storage path, not an unrestricted public download URL.
+        const customer = getCustomer(customerId);
+        if (!customer) throw new Error('Customer no longer exists');
+        customer.documents = customer.documents || [];
+        customer.documents.push({ id, name: file.name, path, uploadedAt: new Date().toISOString() });
+        saveData();
+        if (currentCustomerId === customerId) renderCustomerDocuments();
+        toast('Word document shared with customer.', 'success');
+    } catch (err) {
+        console.error(err);
+        toast('Document upload failed: ' + err.message, 'error');
+    }
+}
+
+async function downloadCustomerDocument(customerId, doc) {
+    if (!getVisibleCustomers().some(c => c.id === customerId)) return;
+    try {
+        const url = await storage.ref(doc.path).getDownloadURL();
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Unable to fetch file');
+        const blob = await response.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = doc.name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+    } catch (err) {
+        console.error(err);
+        toast('Download failed: ' + err.message, 'error');
+    }
+}
+
+async function deleteCustomerDocument(customerId, doc) {
+    if (!isAdmin || !confirm(`Delete document "${doc.name}"?`)) return;
+    try {
+        await storage.ref(doc.path).delete();
+        const customer = getCustomer(customerId);
+        if (customer) {
+            customer.documents = (customer.documents || []).filter(d => d.id !== doc.id);
+            saveData();
+            renderCustomerDocuments();
+        }
+        toast('Document deleted.', 'success');
+    } catch (err) {
+        toast('Delete failed: ' + err.message, 'error');
+    }
 }
